@@ -1,0 +1,154 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  source-frozen:
+    name: Game source unchanged
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The game source is exactly what built the shipped APK. A PR may only
+      # change it when the owner has approved that by labelling the PR
+      # `game-code-change`.
+      - name: Compare game source with the base branch
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          APPROVED: ${{ contains(github.event.pull_request.labels.*.name, 'game-code-change') }}
+        run: |
+          git fetch --no-tags --depth=1 origin "$BASE_REF"
+          changed=$(git diff --name-only FETCH_HEAD HEAD -- src res assets jvmtest AndroidManifest.xml build.sh kc.sh zipalign.py rules.pro)
+          if [ -z "$changed" ]; then
+            echo "Game source untouched."
+          elif [ "$APPROVED" = "true" ]; then
+            echo "Game source changed (approved with the game-code-change label):"
+            echo "$changed"
+          else
+            echo "::error::This PR changes game source without the game-code-change label:"
+            echo "$changed"
+            exit 1
+          fi
+
+  build-and-test:
+    name: Build APK & run tests
+    runs-on: ubuntu-latest
+    env:
+      KOTLIN_VERSION: "2.3.10"
+      BUILD_TOOLS: "34.0.0"
+      PLATFORM: "android-34"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Test the Claude Code hooks
+        run: python3 .claude/hooks/test_hooks.py
+
+      - name: Install Android platform and build-tools
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "platforms;$PLATFORM" "build-tools;$BUILD_TOOLS" > /dev/null
+
+      - name: Install the Kotlin compiler
+        working-directory: ${{ runner.temp }}
+        run: |
+          base="https://github.com/JetBrains/kotlin/releases/download/v$KOTLIN_VERSION"
+          curl -fsSL -o kotlinc.zip "$base/kotlin-compiler-$KOTLIN_VERSION.zip"
+          curl -fsSL -o kotlinc.zip.sha256 "$base/kotlin-compiler-$KOTLIN_VERSION.zip.sha256"
+          echo "$(cut -d' ' -f1 kotlinc.zip.sha256)  kotlinc.zip" | sha256sum -c -
+          unzip -q kotlinc.zip
+
+      # build.sh and kc.sh expect the project at /home/claude/blotto and
+      # the toolchain in /home/claude/tc. Recreate that layout instead of
+      # editing the scripts.
+      - name: Lay out the toolchain where the build scripts expect it
+        run: |
+          sudo mkdir -p /home/claude
+          sudo chown "$USER" /home/claude
+          ln -s "$GITHUB_WORKSPACE" /home/claude/blotto
+          TC=/home/claude/tc
+          mkdir -p "$TC"
+          BT="$ANDROID_HOME/build-tools/$BUILD_TOOLS"
+          ln -s "$BT/aapt2" "$TC/aapt2"
+          ln -s "$BT/lib/d8.jar" "$TC/d8.jar"
+          ln -s "$BT/lib/apksigner.jar" "$TC/apksigner.jar"
+          ln -s "$ANDROID_HOME/platforms/$PLATFORM/android.jar" "$TC/android.jar"
+          KL="$RUNNER_TEMP/kotlinc/lib"
+          cp "$KL"/*.jar "$TC/"
+          # The jar names kc.sh puts on the classpath. kotlin-compiler.jar
+          # finds its own dependencies through its manifest Class-Path.
+          cp "$KL/kotlin-compiler.jar"       "$TC/kotlin-jupyter-kernel-0.19.0-944-all.jar"
+          cp "$KL/kotlin-stdlib.jar"         "$TC/kotlin-stdlib-2.3.10-RC.jar"
+          cp "$KL/kotlin-reflect.jar"        "$TC/kotlin-reflect-2.3.10-RC.jar"
+          cp "$KL/kotlin-script-runtime.jar" "$TC/kotlin-script-runtime-2.4.0-dev-6891.jar"
+          unzip -l "$TC/d8.jar" | grep -q "com/android/tools/r8/R8.class"
+
+      - name: Build the APK (build.sh)
+        run: |
+          # build.sh and kc.sh filter compiler output and keep going, so judge
+          # the build by its output, not its exit code.
+          ./build.sh 2>&1 | tee build.log || true
+          if grep -E ": error:|^error:" build.log; then
+            echo "::error::Kotlin compile errors"; exit 1
+          fi
+          test -s build/Blotto.apk
+          unzip -p build/Blotto.apk classes.dex | grep -aq "Lcom/pranvir/blotto/MainActivity;"
+          java -jar /home/claude/tc/apksigner.jar verify build/Blotto.apk
+          /home/claude/tc/aapt2 dump badging build/Blotto.apk | grep -E "^package:|^sdkVersion|^targetSdkVersion"
+
+      # Blotto has no t.sh, so compile and run the tests here the same way the
+      # other games' t.sh does: every game file except the two Android-only
+      # ones, plus the jvmtest harness, through the repo's own kc.sh.
+      - name: Run the game's JVM tests
+        run: |
+          TC=/home/claude/tc
+          # Bot and Harness load the fonts from the toolchain folder
+          cp assets/fonts/ultra.ttf assets/fonts/cinzel.ttf "$TC/"
+          mkdir -p shots build/jvm
+          SRC=$(ls src/com/pranvir/blotto/*.kt | grep -v -e MainActivity -e Audio.kt)
+          ./kc.sh build/jvm "" $SRC jvmtest/shim/*.kt jvmtest/*.kt 2>&1 | tee compile.log
+          if grep -E ": error:|^error:" compile.log; then
+            echo "::error::Kotlin compile errors"; exit 1
+          fi
+          CP="build/jvm:$TC/kotlin-stdlib-2.3.10-RC.jar"
+          for t in PuzzleTestKt AudioTestKt BotKt "HarnessKt monkey"; do
+            echo "== $t"
+            java -Xmx3g -Djava.awt.headless=true -cp "$CP" $t 2>&1 | tee -a test.log
+          done
+          if grep -E "Exception|: error:" test.log; then
+            echo "::error::A test failed"; exit 1
+          fi
+          grep -q "ALL PUZZLE TESTS PASSED" test.log
+          grep -q "BOT OK" test.log
+          grep -q "SCREENSHOTS OK" test.log
+          grep -q "MONKEY OK" test.log
+          test -s shots/audio/music.wav
+          for s in 01_title 05_play_l1 13_play_l100 15_rush 17_timeup 18_title_after; do test -s "shots/$s.png"; done
+
+      - name: Build and tests left the tracked files untouched
+        run: |
+          git status --porcelain --untracked-files=no
+          test -z "$(git status --porcelain --untracked-files=no)"
+
+      # Signed with a throwaway key that build.sh creates on the runner —
+      # for checking only, never a release build.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: blotto-ci-build
+          path: |
+            build/Blotto.apk
+            shots/*.png
+          retention-days: 14

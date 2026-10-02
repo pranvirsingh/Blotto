@@ -1,4 +1,4 @@
-# Build output (build.sh / t.sh)
+# Build output (build.sh and the tests)
 build/
 shots/
 
